@@ -3,6 +3,7 @@ import difflib
 import json
 import os
 import sys
+from urllib.parse import parse_qs, urlparse
 
 import click
 import requests
@@ -12,6 +13,29 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
+DEFAULT_UI_CONFIG = {
+    "text": {
+        "font_size": 14,
+    },
+    "list": {
+        "title_max_len": 60,
+        "table_header_style": "bold magenta",
+    },
+    "check": {
+        "spacing": {
+            "after_header_lines": 0,
+        },
+        "icons": {
+            "ok": "✅",
+            "warn": "❗",
+        },
+        "styles": {
+            "ok": "bold green",
+            "warn": "bold yellow",
+            "error": "bold red",
+        },
+    },
+}
 
 
 def load_env_file(env_path=".env"):
@@ -66,19 +90,6 @@ def parse_target_users(value):
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-load_env_file()
-
-ORGANIZATION = os.getenv("ORGANIZATION", "").strip()
-PAT = os.getenv("PAT", "").strip()
-PROJECT_REPOS = parse_project_repos(os.getenv("PROJECT_REPOS"))
-TARGET_USERS = parse_target_users(os.getenv("TARGET_USERS"))
-
-if not ORGANIZATION:
-    raise ValueError("ORGANIZATION is required in .env")
-if not PAT:
-    raise ValueError("PAT is required in .env")
-
-
 def get_auth_headers():
     credentials = f":{PAT}"
     encoded_credentials = base64.b64encode(credentials.encode()).decode()
@@ -90,6 +101,56 @@ def get_auth_headers():
 
 def is_success(status_code):
     return 200 <= status_code < 300
+
+
+def deep_merge_dict(base, override):
+    merged = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_ui_config(config_path="ui_config.json"):
+    if not os.path.exists(config_path):
+        return DEFAULT_UI_CONFIG
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            payload = json.load(config_file)
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_UI_CONFIG
+
+    if not isinstance(payload, dict):
+        return DEFAULT_UI_CONFIG
+
+    return deep_merge_dict(DEFAULT_UI_CONFIG, payload)
+
+
+def truncate_text(value, max_len):
+    text = (value or "").strip()
+    if len(text) <= max_len:
+        return text
+    if max_len <= 3:
+        return text[:max_len]
+    return text[: max_len - 3].rstrip() + "..."
+
+
+load_env_file()
+UI_CONFIG = load_ui_config()
+
+ORGANIZATION = os.getenv("ORGANIZATION", "").strip()
+PAT = os.getenv("PAT", "").strip()
+PROJECT_REPOS = parse_project_repos(os.getenv("PROJECT_REPOS"))
+TARGET_USERS = parse_target_users(os.getenv("TARGET_USERS"))
+TEST_PIPELINE = os.getenv("TEST_PIPELINE", "Test").strip() or "Test"
+
+if not ORGANIZATION:
+    raise ValueError("ORGANIZATION is required in .env")
+if not PAT:
+    raise ValueError("PAT is required in .env")
 
 
 def iter_project_repo_targets():
@@ -283,6 +344,197 @@ def get_reviewer_vote(taskno, project, repo_id, reviewer_id, headers):
     return response.json().get("vote"), None
 
 
+def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
+    statuses_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/statuses?api-version=7.1"
+    response = requests.get(statuses_url, headers=headers)
+    if not is_success(response.status_code):
+        return "error", None, f"Failed to fetch PR pipeline status. Status code: {response.status_code}"
+
+    statuses = response.json().get("value", [])
+
+    def infer_status_from_pr_statuses(status_items):
+        if not status_items:
+            return "error", "No pipeline status found on this PR."
+
+        ordered = sorted(status_items, key=lambda x: x.get("creationDate") or "", reverse=True)
+        latest = ordered[0]
+        state = (latest.get("state") or "").lower()
+        context = latest.get("context", {}) or {}
+        label = context.get("name") or context.get("genre") or "pipeline"
+
+        if state == "succeeded":
+            return "passed", f"{label} status is succeeded (from PR status)."
+        if state in ("failed", "error"):
+            return "failed", f"{label} status is failed (from PR status)."
+        if state in ("pending", "notset", ""):
+            return "progress", f"{label} status is in progress (from PR status)."
+        return "error", f"{label} status is unknown ({state}) (from PR status)."
+
+    def extract_build_ref(target_url):
+        if not target_url or not isinstance(target_url, str):
+            return None, None
+        parsed = urlparse(target_url)
+        query_params = parse_qs(parsed.query)
+        build_id = (query_params.get("buildId") or [None])[0]
+        if not build_id:
+            return None, None
+
+        path_parts = [part for part in parsed.path.split("/") if part]
+        build_project = path_parts[1] if len(path_parts) > 1 else project
+        return str(build_id), build_project
+
+    build_candidates = []
+    for status in statuses:
+        target_url = (
+            status.get("targetUrl")
+            or status.get("details")
+            or status.get("_links", {}).get("target", {}).get("href")
+            or status.get("_links", {}).get("web", {}).get("href")
+        )
+        build_id, build_project = extract_build_ref(target_url)
+        if build_id:
+            build_candidates.append(
+                {
+                    "build_id": build_id,
+                    "build_project": build_project or project,
+                    "created_at": status.get("creationDate") or "",
+                    "target_url": target_url,
+                }
+            )
+
+    if not build_candidates:
+        builds_url = f"https://dev.azure.com/{ORGANIZATION}/{project}/_apis/build/builds"
+        params = {
+            "repositoryId": repo_id,
+            "repositoryType": "TfsGit",
+            "reasonFilter": "pullRequest",
+            "queryOrder": "queueTimeDescending",
+            "$top": 50,
+            "api-version": "7.1",
+        }
+        builds_response = requests.get(builds_url, headers=headers, params=params)
+        if builds_response.status_code == 401:
+            fallback_state, fallback_message = infer_status_from_pr_statuses(statuses)
+            return (
+                fallback_state,
+                f"{fallback_message} Build API returned 401. PAT needs Build (Read) permission.",
+                None,
+            )
+        if builds_response.status_code == 400:
+            # Some repos return 400 when repository filters are not accepted; retry without repository constraints.
+            retry_params = {
+                "reasonFilter": "pullRequest",
+                "queryOrder": "queueTimeDescending",
+                "$top": 100,
+                "api-version": "7.1",
+            }
+            builds_response = requests.get(builds_url, headers=headers, params=retry_params)
+        if not is_success(builds_response.status_code):
+            return "error", None, f"Failed to fetch PR build list. Status code: {builds_response.status_code}"
+
+        source_ref = (pr_data or {}).get("sourceRefName", "")
+        taskno_token = str(taskno)
+        fallback_candidates = []
+        for build in builds_response.json().get("value", []):
+            trigger_info = build.get("triggerInfo") or {}
+            source_branch = (build.get("sourceBranch") or "").strip()
+            parameters = str(build.get("parameters") or "").replace(" ", "").lower()
+            trigger_text = " ".join([f"{k}:{v}" for k, v in trigger_info.items()]).lower()
+
+            matches_pr = (
+                taskno_token in trigger_text
+                or f"/{taskno_token}/" in source_branch
+                or f"\"pullrequestid\":\"{taskno_token}\"" in parameters
+            )
+            if source_ref and source_branch and source_ref == source_branch:
+                matches_pr = True
+
+            if matches_pr and build.get("id"):
+                fallback_candidates.append(build)
+
+        if not fallback_candidates:
+            return "error", "No pipeline status found on this PR.", None
+
+        latest_build_obj = max(fallback_candidates, key=lambda item: item.get("queueTime") or "")
+        build_candidates.append(
+            {
+                "build_id": str(latest_build_obj.get("id")),
+                "build_project": (latest_build_obj.get("project") or {}).get("name") or project,
+                "created_at": latest_build_obj.get("queueTime") or "",
+                "target_url": (latest_build_obj.get("_links", {}).get("web", {}).get("href")),
+            }
+        )
+
+    selected_build = max(build_candidates, key=lambda item: item.get("created_at") or "")
+    build_id = selected_build["build_id"]
+    build_project = selected_build["build_project"]
+    build_url = f"https://dev.azure.com/{ORGANIZATION}/{build_project}/_apis/build/builds/{build_id}?api-version=7.1"
+    build_response = requests.get(build_url, headers=headers)
+    if build_response.status_code == 401:
+        fallback_state, fallback_message = infer_status_from_pr_statuses(statuses)
+        return (
+            fallback_state,
+            f"{fallback_message} Build API returned 401. PAT needs Build (Read) permission.",
+            None,
+        )
+    if not is_success(build_response.status_code):
+        return "error", None, f"Failed to fetch build #{build_id}. Status code: {build_response.status_code}"
+
+    build_payload = build_response.json()
+    build_status = (build_payload.get("status") or "").lower()
+    build_result = (build_payload.get("result") or "").lower()
+    build_web_url = selected_build.get("target_url") or build_payload.get("_links", {}).get("web", {}).get("href")
+    test_stage_name = TEST_PIPELINE
+
+    timeline_url = (
+        f"https://dev.azure.com/{ORGANIZATION}/{build_project}/_apis/build/builds/{build_id}/timeline?api-version=7.1"
+    )
+    timeline_response = requests.get(timeline_url, headers=headers)
+    if timeline_response.status_code == 401:
+        return "error", f"Failed to fetch build timeline for stage '{test_stage_name}' (401 unauthorized).", None
+    if is_success(timeline_response.status_code):
+        timeline_records = timeline_response.json().get("records", [])
+        stage_record = None
+        for record in timeline_records:
+            if (record.get("type") or "").lower() != "stage":
+                continue
+            if (record.get("name") or "").strip().lower() == test_stage_name.lower():
+                stage_record = record
+                break
+
+        if stage_record:
+            stage_state = (stage_record.get("state") or "").lower()
+            stage_result = (stage_record.get("result") or "").lower()
+            stage_label = stage_record.get("name") or test_stage_name
+
+            if stage_state in ("inprogress", "pending"):
+                return "progress", f"Stage '{stage_label}' is in progress. URL: {build_web_url}", None
+            if stage_state in ("notstarted",):
+                return "progress", f"Stage '{stage_label}' has not started yet. URL: {build_web_url}", None
+            if stage_state == "completed":
+                if stage_result == "succeeded":
+                    return "passed", f"Stage '{stage_label}' passed. URL: {build_web_url}", None
+                if stage_result in ("failed", "canceled", "partiallysucceeded"):
+                    return "failed", f"Stage '{stage_label}' failed ({stage_result}). URL: {build_web_url}", None
+                return "error", f"Stage '{stage_label}' completed with unknown result ({stage_result}). URL: {build_web_url}", None
+
+            return "error", f"Stage '{stage_label}' status is unknown ({stage_state}). URL: {build_web_url}", None
+
+        return "error", f"Stage '{test_stage_name}' not found in build timeline. URL: {build_web_url}", None
+
+    if build_status in ("inprogress", "notstarted", "postponed", "cancelling"):
+        return "progress", f"Build #{build_id} is in progress (stage '{test_stage_name}' was not evaluated). URL: {build_web_url}", None
+
+    if build_status == "completed":
+        if build_result == "succeeded":
+            return "passed", f"Build #{build_id} passed (stage '{test_stage_name}' was not evaluated). URL: {build_web_url}", None
+        if build_result in ("failed", "canceled", "partiallysucceeded"):
+            return "failed", f"Build #{build_id} failed ({build_result}) (stage '{test_stage_name}' was not evaluated). URL: {build_web_url}", None
+        return "error", f"Build #{build_id} completed with unknown result ({build_result}) (stage '{test_stage_name}' was not evaluated). URL: {build_web_url}", None
+
+    return "error", f"Build #{build_id} status is unknown ({build_status}) (stage '{test_stage_name}' was not evaluated). URL: {build_web_url}", None
+
+
 # def merge_pr(taskno, project, repo_id, pr_data, headers):
 #     merge_url = f"{get_pr_base_url(project, repo_id)}/{taskno}?api-version=7.1"
 #     payload = {"status": "completed"}
@@ -317,7 +569,7 @@ def cli():
 
 def check_impl(taskno, with_ai=False):
     headers = get_auth_headers()
-    project, repo_id, _ = find_pr_repo(taskno, headers)
+    project, repo_id, pr_data = find_pr_repo(taskno, headers)
 
     if not project:
         console.print(
@@ -331,24 +583,61 @@ def check_impl(taskno, with_ai=False):
     threads_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/threads?api-version=7.1"
     response = requests.get(threads_url, headers=headers)
 
+    threads_ok = False
+    unresolved_count = 0
+    thread_error_message = None
     if response.status_code != 200:
-        console.print(f"[bold red]❌ Failed to fetch PR data. Status code: {response.status_code}[/bold red]")
+        thread_error_message = f"Failed to fetch PR thread data. Status code: {response.status_code}"
+    else:
+        threads = response.json().get("value", [])
+        unresolved_count = sum(1 for thread in threads if thread.get("status") in ["active", "pending"])
+        threads_ok = unresolved_count == 0
+
+    pipeline_state, pipeline_message, pipeline_error = get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers)
+
+    check_styles = UI_CONFIG["check"]["styles"]
+    check_icons = UI_CONFIG["check"]["icons"]
+    if thread_error_message:
+        console.print(
+            f"[{check_styles['error']}]{check_icons['warn']} Comment: {thread_error_message}[/{check_styles['error']}]"
+        )
+    elif threads_ok:
+        console.print(
+            f"[{check_styles['ok']}]{check_icons['ok']} Comment: All comment threads are resolved."
+            f"[/{check_styles['ok']}]"
+        )
+    else:
+        console.print(
+            f"[{check_styles['warn']}]{check_icons['warn']} Comment: {unresolved_count} unresolved comment thread(s)."
+            f"[/{check_styles['warn']}]"
+        )
+
+    if pipeline_error:
+        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_error}[/{check_styles['error']}]")
         return
 
-    threads = response.json().get("value", [])
-
-    # Check unresolved comments
-    unresolved_threads = []
-    for thread in threads:
-        # Keep only active/pending discussion threads.
-        if thread.get("status") in ["active", "pending"]:
-            unresolved_threads.append(thread)
-
-    if unresolved_threads:
-        console.print(f"[bold red]⚠️ This PR still has {len(unresolved_threads)} unresolved comments.[/bold red]")
+    if pipeline_state == "passed":
+        console.print(f"[{check_styles['ok']}]{check_icons['ok']} Pipeline: {pipeline_message}[/{check_styles['ok']}]")
+    elif pipeline_state == "progress":
+        console.print(f"[{check_styles['warn']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['warn']}]")
+        return
+    elif pipeline_state == "failed":
+        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['error']}]")
+        return
+    else:
+        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['error']}]")
         return
 
-    console.print("[bold green]✅ All comment threads are resolved.[/bold green]")
+    for _ in range(int(UI_CONFIG["check"]["spacing"]["after_header_lines"])):
+        console.print()
+
+    if not threads_ok:
+        return
+
+    if threads_ok and pipeline_state == "passed":
+        console.print(f"[{check_styles['ok']}]{check_icons['ok']} All threads are resolved[/{check_styles['ok']}]")
+    else:
+        return
 
     user, user_error = get_current_user(headers)
     if user_error:
@@ -433,23 +722,29 @@ def list_prs_impl(user_filter=None):
         return
 
     # Build table
-    table = Table(title="Active Pull Request List", show_header=True, header_style="bold magenta")
+    table = Table(
+        title="Active Pull Request List",
+        show_header=True,
+        header_style=UI_CONFIG["list"]["table_header_style"],
+    )
     table.add_column("PR ID", style="dim", width=8, justify="center")
     table.add_column("Project", justify="left", style="yellow")
     table.add_column("Repository", justify="left", style="cyan")
     table.add_column("Title", min_width=30)
     table.add_column("Created By", justify="left", style="green")
-    table.add_column("Target Branch", justify="right", style="blue")
+    table.add_column("Target", justify="right", style="blue")
 
     for pr in prs:
         pr_id = str(pr.get("pullRequestId"))
         project_name = pr.get("_project_name", "Unknown")
         repo_name = pr.get("_repo_name", "Unknown")
-        title = pr.get("title")
+        title = truncate_text(pr.get("title"), int(UI_CONFIG["list"]["title_max_len"]))
         creator = pr.get("createdBy", {}).get("displayName", "Unknown")
         target_ref = pr.get("targetRefName", "").replace("refs/heads/", "")
+        pr_url = f"https://dev.azure.com/{ORGANIZATION}/{project_name}/_git/{repo_name}/pullrequest/{pr_id}"
+        pr_id_cell = Text(pr_id, style=f"link {pr_url}")
 
-        table.add_row(pr_id, project_name, repo_name, title, creator, target_ref)
+        table.add_row(pr_id_cell, project_name, repo_name, title, creator, target_ref)
 
     console.print(table)
 

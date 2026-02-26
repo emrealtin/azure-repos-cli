@@ -1,0 +1,23 @@
+{
+  "text": {
+    "font_size": 14
+  },
+  "list": {
+    "title_max_len": 60,
+    "table_header_style": "bold magenta"
+  },
+  "check": {
+    "spacing": {
+      "after_header_lines": 0
+    },
+    "icons": {
+      "ok": "✅",
+      "warn": "❗"
+    },
+    "styles": {
+      "ok": "bold green",
+      "warn": "bold yellow",
+      "error": "bold red"
+    }
+  }
+}
