@@ -49,6 +49,21 @@ class AzureDevOpsService:
     def get_targets_text(self) -> str:
         return ", ".join([f"{project}/{repo_id}" for project, repo_id in self.iter_project_repo_targets()])
 
+    @staticmethod
+    def get_pr_block_reason_for_review_or_comment(pr_data: dict) -> str | None:
+        status = str((pr_data or {}).get("status") or "").strip().lower()
+        if status == "active":
+            return None
+        if status == "completed":
+            return "Pull request is merged/completed. Review and comment actions are blocked."
+        if status == "abandoned":
+            return "Pull request is abandoned. Review and comment actions are blocked."
+        if status in ("canceled", "cancelled"):
+            return "Pull request is canceled. Review and comment actions are blocked."
+        if status:
+            return f"Pull request is '{status}'. Review and comment actions are blocked."
+        return "Pull request status is unknown. Review and comment actions are blocked."
+
     def render_colored_diff(self, diff_text: str):
         syntax = Syntax(
             diff_text,
@@ -122,11 +137,25 @@ class AzureDevOpsService:
         return str(status_value).strip().lower()
 
     def is_unresolved_comment_thread(self, thread: dict) -> bool:
-        comments = thread.get("comments") or []
-        has_user_comment = any((comment or {}).get("commentType") == 1 for comment in comments)
-        if not has_user_comment:
+        status = self.normalize_thread_status(thread.get("status"))
+        if status not in ("active", "pending"):
             return False
-        return self.normalize_thread_status(thread.get("status")) in ("active", "pending")
+
+        thread_type = str(thread.get("threadType") or "").strip().lower()
+        if thread_type == "system":
+            return False
+
+        comments = thread.get("comments") or []
+        if not comments:
+            return False
+
+        # Count only visible discussion entries; ignore deleted/empty placeholders.
+        has_visible_comment = any(
+            not (comment or {}).get("isDeleted", False)
+            and bool(str((comment or {}).get("content") or "").strip() or (comment or {}).get("id"))
+            for comment in comments
+        )
+        return has_visible_comment
 
     def fetch_file_content_at_commit(self, project, repo_id, file_path, commit_id, headers):
         if not commit_id:
@@ -373,15 +402,15 @@ class AzureDevOpsService:
 
             # Running/queued must win over stale expired entries.
             if any(status in ("running", "queued") for status in statuses):
-                return "progress", "Pipeline is in progress ."
+                return "progress", "Pipeline is in progress."
             if any(status in ("rejected", "broken") for status in statuses):
-                return "failed", "Pipeline failed ."
+                return "failed", "Pipeline failed."
             if all(status in ("approved", "notapplicable") for status in statuses):
-                return "passed", "Pipeline passed ."
+                return "passed", "Pipeline passed."
 
             latest_raw_text = json.dumps(latest_items).lower()
             if "expired" in latest_raw_text:
-                return "failed", "Pipeline status is expired ."
+                return "failed", "Pipeline status is expired."
             return None
 
         def extract_build_ref(target_url):

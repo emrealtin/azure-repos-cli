@@ -1,4 +1,4 @@
-# Azure Review CLI
+# Azure Repos CLI
 
 A modular Python CLI to speed up Azure DevOps pull request workflows.
 
@@ -61,6 +61,8 @@ OPENAI_BASE_URL=https://api.openai.com
 OPENAI_CA_BUNDLE=
 OPENAI_SSL_VERIFY=true
 ```
+
+`OPENAI_CA_BUNDLE` should point to a trusted corporate/root CA bundle. Do not pin a single leaf certificate for `api.openai.com`, because it can become stale and cause intermittent SSL failures.
 
 ## Usage
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import requests
@@ -52,6 +53,26 @@ class AIReviewService:
                     chunks.append(content["text"])
         return "\n".join(chunks).strip()
 
+    @staticmethod
+    def explain_openai_status_code(status_code: int) -> str:
+        explanations = {
+            400: "Bad request. Payload/parameters are invalid.",
+            401: "Unauthorized. API key is missing, invalid, or expired.",
+            403: "Forbidden. Key does not have access to this resource/model.",
+            404: "Not found. Endpoint or model does not exist.",
+            408: "Request timeout. Upstream timeout occurred.",
+            409: "Conflict. Request conflicts with current resource state.",
+            413: "Payload too large. Input is too big.",
+            415: "Unsupported media type. Content-Type is incorrect.",
+            422: "Unprocessable entity. Request format is valid but semantically wrong.",
+            429: "Rate limit exceeded. Too many requests or quota exceeded.",
+            500: "Internal server error on OpenAI side.",
+            502: "Bad gateway from upstream service.",
+            503: "Service unavailable. Try again later.",
+            504: "Gateway timeout from upstream service.",
+        }
+        return explanations.get(status_code, "Unexpected OpenAI API error.")
+
     def get_ai_review_suggestions(self, file_diffs):
         if not self.settings.openai_api_key:
             return None, "OPENAI_API_KEY is missing. Set it in .env for -ai."
@@ -63,15 +84,24 @@ class AIReviewService:
             diff_blocks.append(f"### Page {index} | File: {path}\n```diff\n{diff_text}\n```")
 
         system_prompt = (
-            "You are a strict pull request reviewer. Return JSON only, no markdown, no explanation. "
-            "Provide actionable comments from the diff."
+            "You are a strict Team Lead and Senior Software Developer performing a code review. "
+            "Your task is to thoroughly review pull requests and identify bugs, security flaws, "
+            "performance issues, anti-patterns, syntax errors, and database/query problems. "
+            "You MUST return raw, valid JSON ONLY. "
+            "CRITICAL: Do not use markdown formatting (do not use ```json or ``` blocks). "
+            "Do not include any conversational text, explanations, or greetings. "
+            "The keys in the JSON must remain in English. The values for 'summary' and 'comment' MUST be written in Turkish. "
+            "CRITICAL: The value for 'code_snippet' MUST be the exact, original code from the diff, without any translation."
         )
+
         user_prompt = (
-            "Review the diff pages and propose comments.\n"
-            "Output JSON schema exactly:\n"
-            '{"summary":"string","comments":[{"file_path":"string","line":123,"comment":"string","severity":"low|medium|high"}]}\n'
-            "Only include comments worth posting.\n\n"
-            + "\n\n".join(diff_blocks)
+            "Review the following git diffs and propose actionable, constructive comments. "
+            "Ignore trivial whitespace changes, but be ruthless on logic, security, performance, syntax, and inefficient queries. "
+            "Output EXACTLY according to this JSON schema:\n"
+            '{"summary": "Türkçe genel değerlendirme özeti", '
+            '"comments": [{"file_path": "string", "line": 123, "code_snippet": "orijinal kod satırı veya bloğu", "comment": "Türkçe aksiyon alınabilir geri bildirim", "severity": "low|medium|high"}]}\n\n'
+            "Only include comments that are worth posting. If there are no issues, return an empty comments array.\n\n"
+            f"{chr(10).join(diff_blocks)}"
         )
 
         url = f"{self.settings.openai_base_url.rstrip('/')}/v1/responses"
@@ -88,12 +118,53 @@ class AIReviewService:
         try:
             response = self.http.post(url, headers=headers, json=payload, timeout=120, verify=verify_value)
         except requests.exceptions.SSLError:
-            return None, "OpenAI SSL verification failed. Set OPENAI_CA_BUNDLE or OPENAI_SSL_VERIFY=false (not recommended)."
+            # If a custom bundle is configured, retry once with system trust store.
+            # This prevents frequent failures when a pinned cert file is stale.
+            if self.settings.openai_ca_bundle:
+                fallback_verify = self.settings.openai_ssl_verify
+                if not isinstance(fallback_verify, bool):
+                    fallback_verify = True
+                try:
+                    response = self.http.post(url, headers=headers, json=payload, timeout=120, verify=fallback_verify)
+                    self.console.print(
+                        "[yellow]⚠️ OPENAI_CA_BUNDLE failed; used system SSL verification instead.[/yellow]"
+                    )
+                except requests.exceptions.SSLError:
+                    bundle_hint = self.settings.openai_ca_bundle
+                    if bundle_hint and not os.path.exists(bundle_hint):
+                        return (
+                            None,
+                            f"OpenAI SSL verification failed. OPENAI_CA_BUNDLE path not found: {bundle_hint}",
+                        )
+                    return (
+                        None,
+                        "OpenAI SSL verification failed. OPENAI_CA_BUNDLE may be invalid/outdated. "
+                        "Use your corporate ROOT CA bundle (not leaf cert), or set OPENAI_SSL_VERIFY=false "
+                        "(not recommended).",
+                    )
+            else:
+                return None, "OpenAI SSL verification failed. Set OPENAI_CA_BUNDLE or OPENAI_SSL_VERIFY=false (not recommended)."
         except requests.exceptions.RequestException as exc:
             return None, f"AI review request failed: {exc}"
 
         if not self.azure_service.is_success(response.status_code):
-            return None, f"AI review request failed. Status code: {response.status_code}"
+            explanation = self.explain_openai_status_code(response.status_code)
+            api_message = ""
+            try:
+                error_payload = response.json()
+                error_obj = error_payload.get("error", {}) if isinstance(error_payload, dict) else {}
+                if isinstance(error_obj, dict) and error_obj.get("message"):
+                    api_message = str(error_obj["message"]).strip()
+            except ValueError:
+                api_message = ""
+
+            if api_message:
+                return (
+                    None,
+                    f"AI review request failed. Status code: {response.status_code} ({explanation}) "
+                    f"OpenAI message: {api_message}",
+                )
+            return None, f"AI review request failed. Status code: {response.status_code} ({explanation})"
 
         try:
             result = response.json()
@@ -141,11 +212,7 @@ class AIReviewService:
             self.console.print("[bold yellow]ℹ️ No comment suggestions from AI.[/bold yellow]")
             return
 
-        self.console.print("[bold]Suggested Comments (List)[/bold]")
-        for i, item in enumerate(comments, start=1):
-            self.console.print(f"{i}. [{item['severity']}] {item['file_path']}:{item['line']} -> {item['comment']}")
-
-        self.console.print("[bold]Suggested Comments (Code Block)[/bold]")
+        self.console.print("[bold]Suggested Comments[/bold]")
         self.console.print(Syntax(json.dumps(comments, indent=2, ensure_ascii=False), "json", theme="monokai"))
 
         from rich.prompt import Confirm

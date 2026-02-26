@@ -16,3 +16,5 @@ build/
 .idea/
 .idea
 .pr_repo_cache.json
+cert/*
+!cert/.gitkeep

@@ -50,32 +50,32 @@ def check_impl(taskno, with_ai=False):
     pipeline_state, pipeline_message, pipeline_error = azure.get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers)
 
     if thread_error_message:
-        console.print(f"[bold red]❗ Comment: {thread_error_message}[/bold red]")
+        console.print(f"[bold red]⚠️ Comment: {thread_error_message}[/bold red]")
     elif threads_ok:
         console.print("[bold green]✅ Comment: All comment threads are resolved.[/bold green]")
     else:
-        console.print(f"[bold yellow]❗ Comment: {unresolved_count} unresolved comment thread(s).[/bold yellow]")
+        console.print(f"[bold yellow]⚠️ Comment: {unresolved_count} unresolved comment thread(s).[/bold yellow]")
 
     is_draft = bool((pr_data or {}).get("isDraft"))
     if is_draft:
-        console.print("[bold yellow]❗ Status: Pull request is draft.[/bold yellow]")
+        console.print("[bold yellow]⚠️ Status: Pull request is draft.[/bold yellow]")
     else:
-        console.print("[bold green]✅ Status: Pull request is ready.[/bold green]")
+        console.print("[bold green]✅ Status: Pull request is ready. Not Draft[/bold green]")
 
     if pipeline_error:
-        console.print(f"[bold red]❗ Pipeline: {pipeline_error}[/bold red]")
+        console.print(f"[bold red]⚠️ Pipeline: {pipeline_error}[/bold red]")
         return
 
     if pipeline_state == "passed":
         console.print(f"[bold green]✅ Pipeline: {pipeline_message}[/bold green]")
     elif pipeline_state == "progress":
-        console.print(f"[bold yellow]❗ Pipeline: {pipeline_message}[/bold yellow]")
+        console.print(f"[bold yellow]⚠️ Pipeline: {pipeline_message}[/bold yellow]")
         return
     elif pipeline_state == "failed":
-        console.print(f"[bold red]❗ Pipeline: {pipeline_message}[/bold red]")
+        console.print(f"[bold red]❌ Pipeline: {pipeline_message}[/bold red]")
         return
     else:
-        console.print(f"[bold red]❗ Pipeline: {pipeline_message}[/bold red]")
+        console.print(f"[bold red]❌ Pipeline: {pipeline_message}[/bold red]")
         return
 
     if not threads_ok:
@@ -171,6 +171,10 @@ def review_impl(taskno, with_ai=False):
     if not project:
         console.print(f"[bold red]❌ {cache_error}[/bold red]")
         return
+    block_reason = azure.get_pr_block_reason_for_review_or_comment(pr_data)
+    if block_reason:
+        console.print(f"[bold yellow]⚠️ {block_reason}[/bold yellow]")
+        return
 
     repo_name = pr_data.get("repository", {}).get("name", repo_id)
     console.print(f"⏳ [cyan]Fetching diff for PR #{taskno}...[/cyan] [dim](Project: {project}, Repository: {repo_name})[/dim]")
@@ -238,9 +242,13 @@ def review_impl(taskno, with_ai=False):
 def comment_impl(taskno, comment_text):
     http.log_operation(f"Run comment command for PR #{taskno}")
     headers = azure.get_auth_headers()
-    project, repo_id, _, cache_error = azure.find_pr_repo_from_cache(taskno, headers)
+    project, repo_id, pr_data, cache_error = azure.find_pr_repo_from_cache(taskno, headers)
     if not project:
         console.print(f"[bold red]❌ {cache_error}[/bold red]")
+        return
+    block_reason = azure.get_pr_block_reason_for_review_or_comment(pr_data)
+    if block_reason:
+        console.print(f"[bold yellow]⚠️ {block_reason}[/bold yellow]")
         return
 
     error = azure.add_general_comment(taskno, project, repo_id, comment_text, headers)

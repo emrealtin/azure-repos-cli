@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import warnings
+
 import requests
 from rich.console import Console
+from urllib3.exceptions import InsecureRequestWarning
 
 
 class HttpClient:
@@ -24,7 +27,14 @@ class HttpClient:
             if kwargs.get("json"):
                 self.console.print(f"[dim]  json={kwargs['json']}[/dim]")
 
-        response = requests.request(method=method.upper(), url=url, **kwargs)
+        verify_value = kwargs.get("verify", True)
+        if verify_value is False:
+            self.console.print("[yellow]SSL certificate verification is disabled for this HTTP request.[/yellow]")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                response = requests.request(method=method.upper(), url=url, **kwargs)
+        else:
+            response = requests.request(method=method.upper(), url=url, **kwargs)
 
         if self.log_enabled:
             self.console.print(f"[dim]  -> status={response.status_code}[/dim]")
