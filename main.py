@@ -2,6 +2,7 @@ import base64
 import difflib
 import json
 import os
+import sys
 
 import click
 import requests
@@ -274,6 +275,14 @@ def approve_pr(taskno, project, repo_id, headers):
     return None
 
 
+def get_reviewer_vote(taskno, project, repo_id, reviewer_id, headers):
+    reviewer_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/reviewers/{reviewer_id}?api-version=7.1"
+    response = requests.get(reviewer_url, headers=headers)
+    if not is_success(response.status_code):
+        return None, f"Failed to fetch reviewer vote. Status code: {response.status_code}"
+    return response.json().get("vote"), None
+
+
 # def merge_pr(taskno, project, repo_id, pr_data, headers):
 #     merge_url = f"{get_pr_base_url(project, repo_id)}/{taskno}?api-version=7.1"
 #     payload = {"status": "completed"}
@@ -306,11 +315,7 @@ def cli():
     pass
 
 
-@cli.command()
-@click.option("--taskno", required=True, help="Pull request number to check")
-def check(taskno):
-    """Checks unresolved comments in a PR and approves it."""
-
+def check_impl(taskno, with_ai=False):
     headers = get_auth_headers()
     project, repo_id, _ = find_pr_repo(taskno, headers)
 
@@ -345,6 +350,23 @@ def check(taskno):
 
     console.print("[bold green]✅ All comment threads are resolved.[/bold green]")
 
+    user, user_error = get_current_user(headers)
+    if user_error:
+        console.print(f"[bold red]❌ {user_error}[/bold red]")
+        return
+
+    reviewer_id = user.get("id")
+    vote, vote_error = get_reviewer_vote(taskno, project, repo_id, reviewer_id, headers)
+    if vote_error:
+        console.print(f"[bold red]❌ {vote_error}[/bold red]")
+        return
+
+    if vote == 10:
+        console.print("[bold yellow]ℹ️ PR is already approved by you. Skipping approval prompt.[/bold yellow]")
+        if with_ai:
+            review_impl(taskno, with_ai=True)
+        return
+
     # 2. Approve step (merge is temporarily disabled)
     approve = Confirm.ask(f"❓ Do you want to [bold green]approve[/bold green] PR #{taskno}?")
     if approve:
@@ -357,10 +379,13 @@ def check(taskno):
         console.print("[yellow]ℹ️ Merge is temporarily disabled in code.[/yellow]")
     else:
         console.print("[yellow]Approval step skipped.[/yellow]")
+        return
+
+    if with_ai:
+        review_impl(taskno, with_ai=True)
 
 
-@cli.command(name="list")
-def list_prs():
+def list_prs_impl(user_filter=None):
     """Lists active pull requests opened by configured team members."""
 
     headers = get_auth_headers()
@@ -386,21 +411,24 @@ def list_prs():
             pr["_repo_name"] = pr.get("repository", {}).get("name") or repo_id
         prs.extend(repo_prs)
 
+    effective_users = [user_filter] if user_filter else TARGET_USERS
+
     # Filter by configured users
-    if TARGET_USERS:
+    if effective_users:
         filtered_prs = []
         for pr in prs:
             creator_name = pr.get("createdBy", {}).get("displayName", "").lower()
 
             # Keep PR if creator name matches one of the configured target users.
-            if any(target.lower() in creator_name for target in TARGET_USERS):
+            if any(target.lower() in creator_name for target in effective_users):
                 filtered_prs.append(pr)
 
         prs = filtered_prs
 
     if not prs:
+        users_text = ", ".join(effective_users) if effective_users else "all users"
         console.print(
-            f"[bold yellow]ℹ️ No active pull requests found for configured users ({', '.join(TARGET_USERS)}).[/bold yellow]"
+            f"[bold yellow]ℹ️ No active pull requests found for configured users ({users_text}).[/bold yellow]"
         )
         return
 
@@ -426,12 +454,7 @@ def list_prs():
     console.print(table)
 
 
-@cli.command()
-@click.option("--taskno", required=True, help="Pull request number to fetch diff for")
-@click.option("--withai", is_flag=True, help="Send fetched diff to mock AI review flow")
-def review(taskno, withai):
-    """Fetches PR diff information and optionally runs mock AI review."""
-
+def review_impl(taskno, with_ai=False):
     headers = get_auth_headers()
     project, repo_id, pr_data = find_pr_repo(taskno, headers)
     if not project:
@@ -462,12 +485,116 @@ def review(taskno, withai):
         console.rule(f"[bold]File: {file_path}[/bold] [dim]({change_type})[/dim]")
         console.print(render_colored_diff(diff_text))
 
-    if withai:
+    if with_ai:
         console.print("\n[cyan]🤖 Sending diff to mock AI review service...[/cyan]")
         merged_diff_text = "\n\n".join([fd.get("diff_text", "") for fd in file_diffs if fd.get("diff_text")])
         ai_result = mock_ai_review(merged_diff_text)
         console.print(f"[bold magenta]{ai_result}[/bold magenta]")
 
 
+def comment_impl(taskno, comment_text):
+    headers = get_auth_headers()
+    project, repo_id, _ = find_pr_repo(taskno, headers)
+    if not project:
+        console.print(
+            f"[bold red]❌ PR #{taskno} was not found in configured project/repo targets ({get_targets_text()}).[/bold red]"
+        )
+        return
+
+    threads_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/threads?api-version=7.1"
+    payload = {
+        "comments": [{"parentCommentId": 0, "content": comment_text, "commentType": 1}],
+        "status": "active",
+    }
+    response = requests.post(threads_url, headers=headers, json=payload)
+    if not is_success(response.status_code):
+        console.print(f"[bold red]❌ Failed to add comment. Status code: {response.status_code}[/bold red]")
+        return
+
+    console.print("[bold green]✅ Comment added successfully.[/bold green]")
+
+
+@cli.command(name="list")
+@click.option("-u", "-user", "--user", "user_filter", type=str, help="Filter PR list by creator name")
+def list_command(user_filter):
+    """Lists active pull requests opened by configured team members."""
+    list_prs_impl(user_filter=user_filter)
+
+
+@cli.command(name="check")
+@click.argument("taskno")
+@click.option("-ai", "--ai", "with_ai", is_flag=True, help="Run mock AI review output")
+def check_command(taskno, with_ai):
+    """Checks unresolved comments in a PR and approves it."""
+    check_impl(taskno, with_ai=with_ai)
+
+
+@cli.command(name="review")
+@click.argument("taskno")
+@click.option("-ai", "--ai", "with_ai", is_flag=True, help="Send fetched diff to mock AI review flow")
+def review_command(taskno, with_ai):
+    """Fetches PR diff information and optionally runs mock AI review."""
+    review_impl(taskno, with_ai=with_ai)
+
+
+@cli.command(name="comment")
+@click.argument("taskno")
+@click.argument("comment_text", nargs=-1)
+def comment_command(taskno, comment_text):
+    """Adds a top-level comment thread to a PR."""
+    comment_text_value = " ".join(comment_text).strip()
+    if not comment_text_value:
+        raise click.UsageError("Missing comment text. Usage: main.py comment <ID> \"your comment\"")
+    comment_impl(taskno, comment_text_value)
+
+
+def normalize_alias_args(argv):
+    if not argv:
+        return argv
+
+    first = argv[0]
+    args = argv[1:]
+
+    if first in ("-l", "-list", "--list"):
+        normalized = ["list"]
+        for item in args:
+            if item == "-user":
+                normalized.append("--user")
+            else:
+                normalized.append(item)
+        return normalized
+
+    if first in ("-c", "-check", "--check"):
+        with_ai = False
+        remaining = []
+        for item in args:
+            if item in ("-ai", "--ai"):
+                with_ai = True
+            else:
+                remaining.append(item)
+        normalized = ["check"]
+        if with_ai:
+            normalized.append("--ai")
+        return normalized + remaining
+
+    if first in ("-r", "-review", "--review"):
+        with_ai = False
+        remaining = []
+        for item in args:
+            if item in ("-ai", "--ai"):
+                with_ai = True
+            else:
+                remaining.append(item)
+        normalized = ["review"]
+        if with_ai:
+            normalized.append("--ai")
+        return normalized + remaining
+
+    if first in ("-cm", "-comment", "--comment"):
+        return ["comment"] + args
+
+    return argv
+
+
 if __name__ == "__main__":
-    cli()
+    cli.main(args=normalize_alias_args(sys.argv[1:]), prog_name=os.path.basename(sys.argv[0]))
