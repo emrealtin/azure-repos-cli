@@ -13,29 +13,9 @@ from rich.table import Table
 from rich.text import Text
 
 console = Console()
-DEFAULT_UI_CONFIG = {
-    "text": {
-        "font_size": 14,
-    },
-    "list": {
-        "title_max_len": 60,
-        "table_header_style": "bold magenta",
-    },
-    "check": {
-        "spacing": {
-            "after_header_lines": 0,
-        },
-        "icons": {
-            "ok": "✅",
-            "warn": "❗",
-        },
-        "styles": {
-            "ok": "bold green",
-            "warn": "bold yellow",
-            "error": "bold red",
-        },
-    },
-}
+TITLE_MAX_LEN = 60
+LOG_ENABLED = False
+PR_CACHE_FILE = ".pr_repo_cache.json"
 
 
 def load_env_file(env_path=".env"):
@@ -103,30 +83,43 @@ def is_success(status_code):
     return 200 <= status_code < 300
 
 
-def deep_merge_dict(base, override):
-    merged = dict(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = deep_merge_dict(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
+def set_log_enabled(value):
+    global LOG_ENABLED
+    LOG_ENABLED = bool(value)
 
 
-def load_ui_config(config_path="ui_config.json"):
-    if not os.path.exists(config_path):
-        return DEFAULT_UI_CONFIG
+def log_operation(message):
+    if LOG_ENABLED:
+        console.print(f"[dim]LOG {message}[/dim]")
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as config_file:
-            payload = json.load(config_file)
-    except (OSError, json.JSONDecodeError):
-        return DEFAULT_UI_CONFIG
 
-    if not isinstance(payload, dict):
-        return DEFAULT_UI_CONFIG
+def http_request(method, url, **kwargs):
+    if LOG_ENABLED:
+        console.print(f"[dim]HTTP {method.upper()} {url}[/dim]")
+        params = kwargs.get("params")
+        payload = kwargs.get("json")
+        if params:
+            console.print(f"[dim]  params={params}[/dim]")
+        if payload:
+            console.print(f"[dim]  json={payload}[/dim]")
 
-    return deep_merge_dict(DEFAULT_UI_CONFIG, payload)
+    response = requests.request(method=method.upper(), url=url, **kwargs)
+
+    if LOG_ENABLED:
+        console.print(f"[dim]  -> status={response.status_code}[/dim]")
+    return response
+
+
+def http_get(url, **kwargs):
+    return http_request("GET", url, **kwargs)
+
+
+def http_post(url, **kwargs):
+    return http_request("POST", url, **kwargs)
+
+
+def http_put(url, **kwargs):
+    return http_request("PUT", url, **kwargs)
 
 
 def truncate_text(value, max_len):
@@ -139,7 +132,6 @@ def truncate_text(value, max_len):
 
 
 load_env_file()
-UI_CONFIG = load_ui_config()
 
 ORGANIZATION = os.getenv("ORGANIZATION", "").strip()
 PAT = os.getenv("PAT", "").strip()
@@ -167,9 +159,82 @@ def get_targets_text():
     return ", ".join([f"{project}/{repo_id}" for project, repo_id in iter_project_repo_targets()])
 
 
+def load_pr_repo_cache():
+    if not os.path.exists(PR_CACHE_FILE):
+        return {}
+    try:
+        with open(PR_CACHE_FILE, "r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def save_pr_repo_cache(cache_data):
+    try:
+        with open(PR_CACHE_FILE, "w", encoding="utf-8") as cache_file:
+            json.dump(cache_data, cache_file, ensure_ascii=True, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
+def update_pr_repo_cache(prs):
+    cache_data = load_pr_repo_cache()
+    for pr in prs:
+        pr_id = str(pr.get("pullRequestId") or "").strip()
+        project_name = str(pr.get("_project_name") or "").strip()
+        repo_id = str(pr.get("repository", {}).get("id") or "").strip()
+        repo_name = str(pr.get("_repo_name") or "").strip()
+        if not pr_id or not project_name or not repo_id:
+            continue
+        cache_data[pr_id] = {
+            "project": project_name,
+            "repo_id": repo_id,
+            "repo_name": repo_name,
+        }
+    save_pr_repo_cache(cache_data)
+
+
+def find_pr_repo_from_cache(taskno, headers):
+    cache_data = load_pr_repo_cache()
+    cache_entry = cache_data.get(str(taskno))
+    if not cache_entry:
+        return None, None, None, (
+            f"PR #{taskno} repository mapping was not found in cache. "
+            "Run `list` first so PR->repo mapping can be cached."
+        )
+
+    project = cache_entry.get("project")
+    repo_id = cache_entry.get("repo_id")
+    if not project or not repo_id:
+        return None, None, None, (
+            f"PR #{taskno} cache entry is invalid. "
+            "Run `list` again to refresh cache."
+        )
+
+    pr_url = f"{get_pr_base_url(project, repo_id)}/{taskno}?api-version=7.1"
+    response = http_get(pr_url, headers=headers)
+    if response.status_code == 200:
+        return project, repo_id, response.json(), None
+
+    if response.status_code == 404:
+        return None, None, None, (
+            f"PR #{taskno} was not found in cached repo target ({project}/{repo_id}). "
+            "Run `list` again to refresh cache."
+        )
+
+    return None, None, None, (
+        f"Failed to fetch PR #{taskno} from cached repo target ({project}/{repo_id}). "
+        f"Status code: {response.status_code}"
+    )
+
+
 def get_current_user(headers):
+    log_operation("Fetch current user")
     url = f"https://dev.azure.com/{ORGANIZATION}/_apis/connectionData?api-version=7.1-preview.1"
-    response = requests.get(url, headers=headers)
+    response = http_get(url, headers=headers)
     if not is_success(response.status_code):
         return None, f"Failed to fetch current user info. Status code: {response.status_code}"
 
@@ -181,9 +246,10 @@ def get_current_user(headers):
 
 
 def find_pr_repo(taskno, headers):
+    log_operation(f"Find PR #{taskno} in configured repositories")
     for project, repo_id in iter_project_repo_targets():
         pr_url = f"{get_pr_base_url(project, repo_id)}/{taskno}?api-version=7.1"
-        response = requests.get(pr_url, headers=headers)
+        response = http_get(pr_url, headers=headers)
         if response.status_code == 200:
             return project, repo_id, response.json()
     return None, None, None
@@ -201,7 +267,7 @@ def fetch_file_content_at_commit(project, repo_id, file_path, commit_id, headers
         "includeContent": "true",
         "api-version": "7.1",
     }
-    response = requests.get(url, headers=headers, params=params)
+    response = http_get(url, headers=headers, params=params)
 
     if response.status_code == 404:
         return "", None
@@ -236,8 +302,9 @@ def render_colored_diff(diff_text):
 
 
 def get_pr_diff(taskno, project, repo_id, headers):
+    log_operation(f"Fetch diff for PR #{taskno}")
     iterations_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/iterations?api-version=7.1"
-    iterations_response = requests.get(iterations_url, headers=headers)
+    iterations_response = http_get(iterations_url, headers=headers)
     if iterations_response.status_code != 200:
         return None, f"Failed to fetch iteration data. Status code: {iterations_response.status_code}"
 
@@ -254,7 +321,7 @@ def get_pr_diff(taskno, project, repo_id, headers):
         f"{get_pr_base_url(project, repo_id)}/{taskno}/iterations/{latest_iteration}/changes"
         f"?api-version=7.1&$top=2000"
     )
-    changes_response = requests.get(changes_url, headers=headers)
+    changes_response = http_get(changes_url, headers=headers)
     if changes_response.status_code != 200:
         return None, f"Failed to fetch diff changes. Status code: {changes_response.status_code}"
 
@@ -324,29 +391,32 @@ def get_pr_diff(taskno, project, repo_id, headers):
 
 
 def approve_pr(taskno, project, repo_id, headers):
+    log_operation(f"Approve PR #{taskno}")
     user, error = get_current_user(headers)
     if error:
         return error
 
     reviewer_id = user.get("id")
     reviewer_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/reviewers/{reviewer_id}?api-version=7.1"
-    response = requests.put(reviewer_url, json={"vote": 10}, headers=headers)
+    response = http_put(reviewer_url, json={"vote": 10}, headers=headers)
     if not is_success(response.status_code):
         return f"Approve request failed. Status code: {response.status_code}"
     return None
 
 
 def get_reviewer_vote(taskno, project, repo_id, reviewer_id, headers):
+    log_operation(f"Fetch reviewer vote for PR #{taskno}")
     reviewer_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/reviewers/{reviewer_id}?api-version=7.1"
-    response = requests.get(reviewer_url, headers=headers)
+    response = http_get(reviewer_url, headers=headers)
     if not is_success(response.status_code):
         return None, f"Failed to fetch reviewer vote. Status code: {response.status_code}"
     return response.json().get("vote"), None
 
 
 def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
+    log_operation(f"Evaluate pipeline status for PR #{taskno}")
     statuses_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/statuses?api-version=7.1"
-    response = requests.get(statuses_url, headers=headers)
+    response = http_get(statuses_url, headers=headers)
     if not is_success(response.status_code):
         return "error", None, f"Failed to fetch PR pipeline status. Status code: {response.status_code}"
 
@@ -412,7 +482,7 @@ def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
             "$top": 50,
             "api-version": "7.1",
         }
-        builds_response = requests.get(builds_url, headers=headers, params=params)
+        builds_response = http_get(builds_url, headers=headers, params=params)
         if builds_response.status_code == 401:
             fallback_state, fallback_message = infer_status_from_pr_statuses(statuses)
             return (
@@ -428,7 +498,7 @@ def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
                 "$top": 100,
                 "api-version": "7.1",
             }
-            builds_response = requests.get(builds_url, headers=headers, params=retry_params)
+            builds_response = http_get(builds_url, headers=headers, params=retry_params)
         if not is_success(builds_response.status_code):
             return "error", None, f"Failed to fetch PR build list. Status code: {builds_response.status_code}"
 
@@ -469,7 +539,7 @@ def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
     build_id = selected_build["build_id"]
     build_project = selected_build["build_project"]
     build_url = f"https://dev.azure.com/{ORGANIZATION}/{build_project}/_apis/build/builds/{build_id}?api-version=7.1"
-    build_response = requests.get(build_url, headers=headers)
+    build_response = http_get(build_url, headers=headers)
     if build_response.status_code == 401:
         fallback_state, fallback_message = infer_status_from_pr_statuses(statuses)
         return (
@@ -489,7 +559,7 @@ def get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers):
     timeline_url = (
         f"https://dev.azure.com/{ORGANIZATION}/{build_project}/_apis/build/builds/{build_id}/timeline?api-version=7.1"
     )
-    timeline_response = requests.get(timeline_url, headers=headers)
+    timeline_response = http_get(timeline_url, headers=headers)
     if timeline_response.status_code == 401:
         return "error", f"Failed to fetch build timeline for stage '{test_stage_name}' (401 unauthorized).", None
     if is_success(timeline_response.status_code):
@@ -568,20 +638,19 @@ def cli():
 
 
 def check_impl(taskno, with_ai=False):
+    log_operation(f"Run check command for PR #{taskno}")
     headers = get_auth_headers()
-    project, repo_id, pr_data = find_pr_repo(taskno, headers)
+    project, repo_id, pr_data, cache_error = find_pr_repo_from_cache(taskno, headers)
 
     if not project:
-        console.print(
-            f"[bold red]❌ PR #{taskno} was not found in configured project/repo targets ({get_targets_text()}).[/bold red]"
-        )
+        console.print(f"[bold red]❌ {cache_error}[/bold red]")
         return
 
     console.print(f"⏳ [bold blue]Checking PR #{taskno}...[/bold blue]")
 
     # 1. Fetch PR threads (comments)
     threads_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/threads?api-version=7.1"
-    response = requests.get(threads_url, headers=headers)
+    response = http_get(threads_url, headers=headers)
 
     threads_ok = False
     unresolved_count = 0
@@ -595,47 +664,44 @@ def check_impl(taskno, with_ai=False):
 
     pipeline_state, pipeline_message, pipeline_error = get_pr_pipeline_status(taskno, project, repo_id, pr_data, headers)
 
-    check_styles = UI_CONFIG["check"]["styles"]
-    check_icons = UI_CONFIG["check"]["icons"]
     if thread_error_message:
-        console.print(
-            f"[{check_styles['error']}]{check_icons['warn']} Comment: {thread_error_message}[/{check_styles['error']}]"
-        )
+        console.print(f"[bold red]❗ Comment: {thread_error_message}[/bold red]")
     elif threads_ok:
-        console.print(
-            f"[{check_styles['ok']}]{check_icons['ok']} Comment: All comment threads are resolved."
-            f"[/{check_styles['ok']}]"
-        )
+        console.print("[bold green]✅ Comment: All comment threads are resolved.[/bold green]")
     else:
-        console.print(
-            f"[{check_styles['warn']}]{check_icons['warn']} Comment: {unresolved_count} unresolved comment thread(s)."
-            f"[/{check_styles['warn']}]"
-        )
+        console.print(f"[bold yellow]❗ Comment: {unresolved_count} unresolved comment thread(s).[/bold yellow]")
+
+    is_draft = bool((pr_data or {}).get("isDraft"))
+    if is_draft:
+        console.print("[bold yellow]❗ Draft: Pull request is draft.[/bold yellow]")
+    else:
+        console.print("[bold green]✅ Draft: Pull request is ready for review.[/bold green]")
 
     if pipeline_error:
-        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_error}[/{check_styles['error']}]")
+        console.print(f"[bold red]❗ Pipeline: {pipeline_error}[/bold red]")
         return
 
     if pipeline_state == "passed":
-        console.print(f"[{check_styles['ok']}]{check_icons['ok']} Pipeline: {pipeline_message}[/{check_styles['ok']}]")
+        console.print(f"[bold green]✅ Pipeline: {pipeline_message}[/bold green]")
     elif pipeline_state == "progress":
-        console.print(f"[{check_styles['warn']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['warn']}]")
+        console.print(f"[bold yellow]❗ Pipeline: {pipeline_message}[/bold yellow]")
         return
     elif pipeline_state == "failed":
-        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['error']}]")
+        console.print(f"[bold red]❗ Pipeline: {pipeline_message}[/bold red]")
         return
     else:
-        console.print(f"[{check_styles['error']}]{check_icons['warn']} Pipeline: {pipeline_message}[/{check_styles['error']}]")
+        console.print(f"[bold red]❗ Pipeline: {pipeline_message}[/bold red]")
         return
-
-    for _ in range(int(UI_CONFIG["check"]["spacing"]["after_header_lines"])):
-        console.print()
 
     if not threads_ok:
         return
 
+    if is_draft:
+        console.print("[bold yellow]❗ Draft PR cannot be approved.[/bold yellow]")
+        return
+
     if threads_ok and pipeline_state == "passed":
-        console.print(f"[{check_styles['ok']}]{check_icons['ok']} All threads are resolved[/{check_styles['ok']}]")
+        console.print("[bold green]✅ All threads are resolved[/bold green]")
     else:
         return
 
@@ -677,6 +743,7 @@ def check_impl(taskno, with_ai=False):
 def list_prs_impl(user_filter=None):
     """Lists active pull requests opened by configured team members."""
 
+    log_operation("Run list command")
     headers = get_auth_headers()
 
     console.print("⏳ [cyan]Fetching active pull requests...[/cyan]")
@@ -686,7 +753,7 @@ def list_prs_impl(user_filter=None):
             f"https://dev.azure.com/{ORGANIZATION}/{project}/_apis/git/repositories/"
             f"{repo_id}/pullRequests?searchCriteria.status=active&api-version=7.1"
         )
-        response = requests.get(url, headers=headers)
+        response = http_get(url, headers=headers)
 
         if response.status_code != 200:
             console.print(
@@ -699,6 +766,8 @@ def list_prs_impl(user_filter=None):
             pr["_project_name"] = project
             pr["_repo_name"] = pr.get("repository", {}).get("name") or repo_id
         prs.extend(repo_prs)
+
+    update_pr_repo_cache(prs)
 
     effective_users = [user_filter] if user_filter else TARGET_USERS
 
@@ -722,11 +791,7 @@ def list_prs_impl(user_filter=None):
         return
 
     # Build table
-    table = Table(
-        title="Active Pull Request List",
-        show_header=True,
-        header_style=UI_CONFIG["list"]["table_header_style"],
-    )
+    table = Table(title="Active Pull Request List", show_header=True, header_style="bold magenta")
     table.add_column("PR ID", style="dim", width=8, justify="center")
     table.add_column("Project", justify="left", style="yellow")
     table.add_column("Repository", justify="left", style="cyan")
@@ -738,7 +803,7 @@ def list_prs_impl(user_filter=None):
         pr_id = str(pr.get("pullRequestId"))
         project_name = pr.get("_project_name", "Unknown")
         repo_name = pr.get("_repo_name", "Unknown")
-        title = truncate_text(pr.get("title"), int(UI_CONFIG["list"]["title_max_len"]))
+        title = truncate_text(pr.get("title"), TITLE_MAX_LEN)
         creator = pr.get("createdBy", {}).get("displayName", "Unknown")
         target_ref = pr.get("targetRefName", "").replace("refs/heads/", "")
         pr_url = f"https://dev.azure.com/{ORGANIZATION}/{project_name}/_git/{repo_name}/pullrequest/{pr_id}"
@@ -750,6 +815,7 @@ def list_prs_impl(user_filter=None):
 
 
 def review_impl(taskno, with_ai=False):
+    log_operation(f"Run review command for PR #{taskno}")
     headers = get_auth_headers()
     project, repo_id, pr_data = find_pr_repo(taskno, headers)
     if not project:
@@ -788,6 +854,7 @@ def review_impl(taskno, with_ai=False):
 
 
 def comment_impl(taskno, comment_text):
+    log_operation(f"Run comment command for PR #{taskno}")
     headers = get_auth_headers()
     project, repo_id, _ = find_pr_repo(taskno, headers)
     if not project:
@@ -801,7 +868,7 @@ def comment_impl(taskno, comment_text):
         "comments": [{"parentCommentId": 0, "content": comment_text, "commentType": 1}],
         "status": "active",
     }
-    response = requests.post(threads_url, headers=headers, json=payload)
+    response = http_post(threads_url, headers=headers, json=payload)
     if not is_success(response.status_code):
         console.print(f"[bold red]❌ Failed to add comment. Status code: {response.status_code}[/bold red]")
         return
@@ -811,32 +878,40 @@ def comment_impl(taskno, comment_text):
 
 @cli.command(name="list")
 @click.option("-u", "-user", "--user", "user_filter", type=str, help="Filter PR list by creator name")
-def list_command(user_filter):
+@click.option("-log", "--log", "log_enabled", is_flag=True, help="Print request and operation logs")
+def list_command(user_filter, log_enabled):
     """Lists active pull requests opened by configured team members."""
+    set_log_enabled(log_enabled)
     list_prs_impl(user_filter=user_filter)
 
 
 @cli.command(name="check")
 @click.argument("taskno")
 @click.option("-ai", "--ai", "with_ai", is_flag=True, help="Run mock AI review output")
-def check_command(taskno, with_ai):
+@click.option("-log", "--log", "log_enabled", is_flag=True, help="Print request and operation logs")
+def check_command(taskno, with_ai, log_enabled):
     """Checks unresolved comments in a PR and approves it."""
+    set_log_enabled(log_enabled)
     check_impl(taskno, with_ai=with_ai)
 
 
 @cli.command(name="review")
 @click.argument("taskno")
 @click.option("-ai", "--ai", "with_ai", is_flag=True, help="Send fetched diff to mock AI review flow")
-def review_command(taskno, with_ai):
+@click.option("-log", "--log", "log_enabled", is_flag=True, help="Print request and operation logs")
+def review_command(taskno, with_ai, log_enabled):
     """Fetches PR diff information and optionally runs mock AI review."""
+    set_log_enabled(log_enabled)
     review_impl(taskno, with_ai=with_ai)
 
 
 @cli.command(name="comment")
 @click.argument("taskno")
 @click.argument("comment_text", nargs=-1)
-def comment_command(taskno, comment_text):
+@click.option("-log", "--log", "log_enabled", is_flag=True, help="Print request and operation logs")
+def comment_command(taskno, comment_text, log_enabled):
     """Adds a top-level comment thread to a PR."""
+    set_log_enabled(log_enabled)
     comment_text_value = " ".join(comment_text).strip()
     if not comment_text_value:
         raise click.UsageError("Missing comment text. Usage: main.py comment <ID> \"your comment\"")
@@ -851,42 +926,67 @@ def normalize_alias_args(argv):
     args = argv[1:]
 
     if first in ("-l", "-list", "--list"):
+        with_log = False
         normalized = ["list"]
         for item in args:
             if item == "-user":
                 normalized.append("--user")
+            elif item in ("-log", "--log"):
+                with_log = True
             else:
                 normalized.append(item)
+        if with_log:
+            normalized.append("--log")
         return normalized
 
     if first in ("-c", "-check", "--check"):
         with_ai = False
+        with_log = False
         remaining = []
         for item in args:
             if item in ("-ai", "--ai"):
                 with_ai = True
+            elif item in ("-log", "--log"):
+                with_log = True
             else:
                 remaining.append(item)
         normalized = ["check"]
         if with_ai:
             normalized.append("--ai")
+        if with_log:
+            normalized.append("--log")
         return normalized + remaining
 
     if first in ("-r", "-review", "--review"):
         with_ai = False
+        with_log = False
         remaining = []
         for item in args:
             if item in ("-ai", "--ai"):
                 with_ai = True
+            elif item in ("-log", "--log"):
+                with_log = True
             else:
                 remaining.append(item)
         normalized = ["review"]
         if with_ai:
             normalized.append("--ai")
+        if with_log:
+            normalized.append("--log")
         return normalized + remaining
 
     if first in ("-cm", "-comment", "--comment"):
-        return ["comment"] + args
+        with_log = False
+        remaining = []
+        for item in args:
+            if item in ("-log", "--log"):
+                with_log = True
+            else:
+                remaining.append(item)
+        normalized = ["comment"]
+        if with_log:
+            normalized.append("--log")
+        return normalized + remaining
 
     return argv
 
