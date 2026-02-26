@@ -6,6 +6,7 @@ import re
 
 import requests
 from rich.syntax import Syntax
+from rich.table import Table
 
 from azure_repos_cli.config import Settings
 from azure_repos_cli.services.azure_devops_service import AzureDevOpsService
@@ -73,6 +74,93 @@ class AIReviewService:
         }
         return explanations.get(status_code, "Unexpected OpenAI API error.")
 
+    @staticmethod
+    def parse_diff_entries(diff_text: str) -> list[dict]:
+        entries: list[dict] = []
+        old_line = None
+        new_line = None
+
+        for raw_line in (diff_text or "").splitlines():
+            if raw_line.startswith("@@"):
+                old_match = re.search(r"-(\d+)(?:,\d+)?", raw_line)
+                new_match = re.search(r"\+(\d+)(?:,\d+)?", raw_line)
+                old_line = int(old_match.group(1)) if old_match else None
+                new_line = int(new_match.group(1)) if new_match else None
+                continue
+            if old_line is None or new_line is None:
+                continue
+            if raw_line.startswith(("---", "+++")):
+                continue
+
+            marker = raw_line[:1]
+            text = raw_line[1:] if marker in (" ", "+", "-") else raw_line
+
+            if marker == " ":
+                entries.append({"marker": " ", "old_line": old_line, "new_line": new_line, "text": text})
+                old_line += 1
+                new_line += 1
+            elif marker == "+":
+                entries.append({"marker": "+", "old_line": None, "new_line": new_line, "text": text})
+                new_line += 1
+            elif marker == "-":
+                entries.append({"marker": "-", "old_line": old_line, "new_line": None, "text": text})
+                old_line += 1
+            else:
+                entries.append({"marker": " ", "old_line": old_line, "new_line": new_line, "text": raw_line})
+                old_line += 1
+                new_line += 1
+
+        return entries
+
+    @staticmethod
+    def get_code_snippet_for_line(diff_text: str, line_number: int, context_lines: int = 6) -> str:
+        if line_number <= 0:
+            return ""
+
+        entries = AIReviewService.parse_diff_entries(diff_text)
+        if not entries:
+            return ""
+
+        target_index = None
+        for idx, entry in enumerate(entries):
+            if entry.get("new_line") == line_number and entry.get("marker") in ("+", " "):
+                target_index = idx
+                break
+
+        if target_index is None:
+            return ""
+
+        start = max(0, target_index - context_lines)
+        end = min(len(entries), target_index + context_lines + 1)
+        window = entries[start:end]
+        snippet_lines = [f"@@ target +{line_number} @@"]
+        for entry in window:
+            marker = str(entry.get("marker") or " ")
+            snippet_lines.append(f"{marker}{entry.get('text', '')}")
+        return "\n".join(snippet_lines).strip()
+
+    @staticmethod
+    def parse_selection_input(raw_value: str, total: int) -> list[int]:
+        raw = (raw_value or "").strip().lower()
+        if not raw:
+            return []
+        if raw in ("all", "*"):
+            return list(range(1, total + 1))
+
+        selected: list[int] = []
+        for token in raw.split(","):
+            value = token.strip()
+            if not value:
+                continue
+            if not value.isdigit():
+                return []
+            idx = int(value)
+            if idx < 1 or idx > total:
+                return []
+            if idx not in selected:
+                selected.append(idx)
+        return selected
+
     def get_ai_review_suggestions(self, file_diffs):
         if not self.settings.openai_api_key:
             return None, "OPENAI_API_KEY is missing. Set it in .env for -ai."
@@ -84,13 +172,15 @@ class AIReviewService:
             diff_blocks.append(f"### Page {index} | File: {path}\n```diff\n{diff_text}\n```")
 
         system_prompt = (
-            "You are a strict Team Lead and Senior Software Developer performing a code review. "
+            "You are a Team Lead and Senior Software Developer performing a code review. "
             "Your task is to thoroughly review pull requests and identify bugs, security flaws, "
             "performance issues, anti-patterns, syntax errors, and database/query problems. "
             "You MUST return raw, valid JSON ONLY. "
             "CRITICAL: Do not use markdown formatting (do not use ```json or ``` blocks). "
             "Do not include any conversational text, explanations, or greetings. "
             "The keys in the JSON must remain in English. The values for 'summary' and 'comment' MUST be written in Turkish. "
+            "Use a natural, direct tone in Turkish as if a team lead is talking to a developer with 'sen' language. "
+            "Do not be overly formal or rude; keep it actionable and concise. "
             "CRITICAL: The value for 'code_snippet' MUST be the exact, original code from the diff, without any translation."
         )
 
@@ -177,13 +267,15 @@ class AIReviewService:
 
         summary = str(parsed.get("summary") or "").strip()
         comments = parsed.get("comments") if isinstance(parsed.get("comments"), list) else []
-        valid_paths = {fd.get("path", "unknown") for fd in file_diffs}
+        diff_by_path = {fd.get("path", "unknown"): fd.get("diff_text", "") for fd in file_diffs}
+        valid_paths = set(diff_by_path.keys())
         normalized = []
         for item in comments:
             if not isinstance(item, dict):
                 continue
             file_path = str(item.get("file_path") or "").strip()
             comment_text = str(item.get("comment") or "").strip()
+            code_snippet = str(item.get("code_snippet") or "").strip()
             severity = str(item.get("severity") or "medium").strip().lower()
             try:
                 line = int(item.get("line"))
@@ -193,7 +285,18 @@ class AIReviewService:
                 continue
             if severity not in ("low", "medium", "high"):
                 severity = "medium"
-            normalized.append({"file_path": file_path, "line": line, "comment": comment_text, "severity": severity})
+            contextual_snippet = self.get_code_snippet_for_line(diff_by_path.get(file_path, ""), line, context_lines=6)
+            if contextual_snippet:
+                code_snippet = contextual_snippet
+            normalized.append(
+                {
+                    "file_path": file_path,
+                    "line": line,
+                    "code_snippet": code_snippet,
+                    "comment": comment_text,
+                    "severity": severity,
+                }
+            )
 
         return {"summary": summary, "comments": normalized}, None
 
@@ -213,17 +316,48 @@ class AIReviewService:
             return
 
         self.console.print("[bold]Suggested Comments[/bold]")
-        self.console.print(Syntax(json.dumps(comments, indent=2, ensure_ascii=False), "json", theme="monokai"))
+        table = Table(show_header=True, header_style="bold cyan", show_lines=True)
+        table.add_column("#", width=4, justify="right")
+        table.add_column("Field", width=10)
+        table.add_column("Value", min_width=100)
 
-        from rich.prompt import Confirm
+        for index, item in enumerate(comments, start=1):
+            code_snippet = str(item.get("code_snippet") or "").strip()
+            severity = str(item.get("severity", "medium")).upper()
+            file_with_line = f"{item.get('file_path', '')}:{item.get('line', '')}"
+            comment_text = str(item.get("comment", ""))
+            path_value = f"[{severity}] {file_with_line}"
+            diff_value = (
+                Syntax(code_snippet, "diff", theme="monokai", line_numbers=False, word_wrap=True)
+                if code_snippet
+                else "-"
+            )
+            table.add_row(str(index), "Path", path_value)
+            table.add_row("", "Comment", comment_text)
+            table.add_row("", "Diff", diff_value)
+        self.console.print(table)
 
-        if not Confirm.ask("Do you want to post all suggested comments to this pull request?", default=False):
+        from rich.prompt import Prompt
+
+        selection_help = "Enter comment numbers to post (e.g. 1,3,5), or 'all'. Leave empty to skip"
+        selected_indices = []
+        while True:
+            raw_selection = Prompt.ask(selection_help, default="")
+            selected_indices = self.parse_selection_input(raw_selection, len(comments))
+            if raw_selection.strip() == "" or selected_indices:
+                break
+            self.console.print("[bold yellow]⚠️ Invalid selection. Use comma-separated numbers in range or 'all'.[/bold yellow]")
+
+        if not selected_indices:
             self.console.print("[yellow]Skipped posting AI comments.[/yellow]")
             return
 
+        selected_comments = [comments[index - 1] for index in selected_indices]
+        self.console.print(f"[cyan]Selected {len(selected_comments)} comment(s) for posting.[/cyan]")
+
         posted = 0
         failed = 0
-        for item in comments:
+        for item in selected_comments:
             error = self.azure_service.add_line_comment(
                 taskno=taskno,
                 project=project,
