@@ -8,7 +8,9 @@ from urllib.parse import parse_qs, urlparse
 import click
 import requests
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -287,18 +289,15 @@ def fetch_file_content_at_commit(project, repo_id, file_path, commit_id, headers
 
 
 def render_colored_diff(diff_text):
-    text = Text()
-    for line in diff_text.splitlines():
-        style = None
-        if line.startswith("+") and not line.startswith("+++"):
-            style = "green"
-        elif line.startswith("-") and not line.startswith("---"):
-            style = "red"
-        elif line.startswith("@@") or line.startswith("diff --git") or line.startswith("---") or line.startswith("+++"):
-            style = "cyan"
-        text.append(line, style=style)
-        text.append("\n")
-    return text
+    syntax = Syntax(
+        diff_text,
+        "diff",
+        theme="monokai",
+        line_numbers=True,
+        word_wrap=False,
+        background_color="default",
+    )
+    return Panel(syntax, border_style="dim", padding=(0, 1))
 
 
 def get_pr_diff(taskno, project, repo_id, headers):
@@ -817,11 +816,9 @@ def list_prs_impl(user_filter=None):
 def review_impl(taskno, with_ai=False):
     log_operation(f"Run review command for PR #{taskno}")
     headers = get_auth_headers()
-    project, repo_id, pr_data = find_pr_repo(taskno, headers)
+    project, repo_id, pr_data, cache_error = find_pr_repo_from_cache(taskno, headers)
     if not project:
-        console.print(
-            f"[bold red]❌ PR #{taskno} was not found in configured project/repo targets ({get_targets_text()}).[/bold red]"
-        )
+        console.print(f"[bold red]❌ {cache_error}[/bold red]")
         return
 
     repo_name = pr_data.get("repository", {}).get("name", repo_id)
@@ -856,11 +853,9 @@ def review_impl(taskno, with_ai=False):
 def comment_impl(taskno, comment_text):
     log_operation(f"Run comment command for PR #{taskno}")
     headers = get_auth_headers()
-    project, repo_id, _ = find_pr_repo(taskno, headers)
+    project, repo_id, _, cache_error = find_pr_repo_from_cache(taskno, headers)
     if not project:
-        console.print(
-            f"[bold red]❌ PR #{taskno} was not found in configured project/repo targets ({get_targets_text()}).[/bold red]"
-        )
+        console.print(f"[bold red]❌ {cache_error}[/bold red]")
         return
 
     threads_url = f"{get_pr_base_url(project, repo_id)}/{taskno}/threads?api-version=7.1"
