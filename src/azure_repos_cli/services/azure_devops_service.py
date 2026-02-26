@@ -352,15 +352,36 @@ class AzureDevOpsService:
             if not build_related:
                 return None
 
-            raw_text = json.dumps(build_related).lower()
-            if "expired" in raw_text:
-                return "failed", "Pipeline status is expired (from policy evaluation)."
-            if any((item.get("status") or "").lower() in ("running", "queued") for item in build_related):
+            # Keep only latest evaluation per policy configuration.
+            latest_by_config = {}
+            for item in build_related:
+                config_id = (item.get("configuration") or {}).get("id") or item.get("id")
+                key = str(config_id)
+                stamp = (
+                    item.get("completedDate")
+                    or item.get("updatedDate")
+                    or item.get("startedDate")
+                    or item.get("creationDate")
+                    or ""
+                )
+                previous = latest_by_config.get(key)
+                if not previous or stamp > previous[0]:
+                    latest_by_config[key] = (stamp, item)
+
+            latest_items = [entry[1] for entry in latest_by_config.values()]
+            statuses = [(item.get("status") or "").lower() for item in latest_items]
+
+            # Running/queued must win over stale expired entries.
+            if any(status in ("running", "queued") for status in statuses):
                 return "progress", "Pipeline is in progress (from policy evaluation)."
-            if any((item.get("status") or "").lower() in ("rejected", "broken") for item in build_related):
+            if any(status in ("rejected", "broken") for status in statuses):
                 return "failed", "Pipeline failed (from policy evaluation)."
-            if all((item.get("status") or "").lower() in ("approved", "notapplicable") for item in build_related):
+            if all(status in ("approved", "notapplicable") for status in statuses):
                 return "passed", "Pipeline passed (from policy evaluation)."
+
+            latest_raw_text = json.dumps(latest_items).lower()
+            if "expired" in latest_raw_text:
+                return "failed", "Pipeline status is expired (from policy evaluation)."
             return None
 
         def extract_build_ref(target_url):
