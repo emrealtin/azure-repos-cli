@@ -373,15 +373,15 @@ class AzureDevOpsService:
 
             # Running/queued must win over stale expired entries.
             if any(status in ("running", "queued") for status in statuses):
-                return "progress", "Pipeline is in progress (from policy evaluation)."
+                return "progress", "Pipeline is in progress ."
             if any(status in ("rejected", "broken") for status in statuses):
-                return "failed", "Pipeline failed (from policy evaluation)."
+                return "failed", "Pipeline failed ."
             if all(status in ("approved", "notapplicable") for status in statuses):
-                return "passed", "Pipeline passed (from policy evaluation)."
+                return "passed", "Pipeline passed ."
 
             latest_raw_text = json.dumps(latest_items).lower()
             if "expired" in latest_raw_text:
-                return "failed", "Pipeline status is expired (from policy evaluation)."
+                return "failed", "Pipeline status is expired ."
             return None
 
         def extract_build_ref(target_url):
